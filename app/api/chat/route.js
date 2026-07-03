@@ -1,3 +1,4 @@
+export const maxDuration = 60;
 const MCP_URL = "https://mcp.kapruka.com/mcp";
 const MODEL = "claude-sonnet-4-6";
 
