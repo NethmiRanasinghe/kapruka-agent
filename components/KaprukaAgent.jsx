@@ -74,8 +74,16 @@ function tryParseJSON(text) {
 
 function formatMoney(amount, currency) {
   if (amount === undefined || amount === null || amount === "") return null;
+  // Defensive: if a tool ever returns a nested shape like {amount: 5440} or
+  // {value: 5440} instead of a plain number, try to unwrap it rather than
+  // stringifying the object (which would print "[object Object]").
+  if (typeof amount === "object") {
+    const unwrapped = pick(amount, ["amount", "value", "price", "total"], null);
+    if (unwrapped === null || typeof unwrapped === "object") return null;
+    amount = unwrapped;
+  }
   const n = typeof amount === "number" ? amount : parseFloat(amount);
-  if (Number.isNaN(n)) return String(amount);
+  if (Number.isNaN(n)) return null;
   const cur = currency || "LKR";
   return `${cur} ${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
