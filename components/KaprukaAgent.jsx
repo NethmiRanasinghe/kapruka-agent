@@ -34,6 +34,7 @@ Rules:
 - When asked to check out, call kapruka_create_order with the full cart, recipient, delivery, sender, and gift_message fields as given.
 - IMPORTANT: after kapruka_check_delivery or kapruka_create_order return, do NOT restate the price breakdown, order number, or pay-link in your text reply — the interface already renders a dedicated card with all of that. Just give one short confirming sentence, e.g. "Delivery's available — I'll place the order now!" or "All set — you can pay using the card above." Never repeat numbers, tables, or links you already got from a tool.
 - For order status questions, call kapruka_track_order with the order number. Same rule applies — don't restate what the tracking card already shows.
+- NEVER use a markdown table (pipe characters "|") anywhere in your reply, for any reason. After a product search, the interface already shows product cards with names and prices — do not re-list them as a table or bullet list. Just give one short, warm sentence recommending 1-2 of them by name (bold is fine), e.g. "The **Vibe Check** box is a great pick for a birthday, or go bigger with **Her Special Day**!"
 - Keep tool-result summaries brief in your text — the interface renders the actual product cards, delivery info, and order details separately, so you don't need to repeat every field back in prose.`;
 
 /* ---------- tiny defensive helpers for unknown JSON shapes ---------- */
@@ -88,22 +89,79 @@ function formatMoney(amount, currency) {
   return `${cur} ${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
 
-/** Very small **bold** / line / "- bullet" renderer for markdown-ish tool text. */
+function renderInlineBold(content, keyPrefix) {
+  return content.split(/(\*\*[^*]+\*\*)/g).map((p, j) =>
+    p.startsWith("**") && p.endsWith("**") ? (
+      <strong key={`${keyPrefix}-${j}`}>{p.slice(2, -2)}</strong>
+    ) : (
+      <React.Fragment key={`${keyPrefix}-${j}`}>{p}</React.Fragment>
+    )
+  );
+}
+
+function splitTableRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim());
+}
+
+const TABLE_ROW_RE = /^\s*\|.*\|\s*$/;
+const TABLE_SEPARATOR_RE = /^\s*\|?[\s:-]+\|[\s:|-]+\s*\|?\s*$/;
+
+/** Small renderer for the markdown-ish text Kapruka's tools return: **bold**,
+ *  "- " bullets, and — as a defensive fallback in case the model still emits
+ *  one despite being told not to — pipe tables rendered as real tables
+ *  instead of raw "| a | b |" text. */
 function LiteMarkdown({ text }) {
   if (!text) return null;
   const lines = text.split("\n");
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (TABLE_ROW_RE.test(lines[i]) && lines[i + 1] && TABLE_SEPARATOR_RE.test(lines[i + 1])) {
+      const header = splitTableRow(lines[i]);
+      let j = i + 2;
+      const rows = [];
+      while (j < lines.length && TABLE_ROW_RE.test(lines[j])) {
+        rows.push(splitTableRow(lines[j]));
+        j++;
+      }
+      blocks.push({ type: "table", header, rows });
+      i = j;
+    } else {
+      blocks.push({ type: "line", text: lines[i] });
+      i++;
+    }
+  }
+
   return (
     <div className="lite-md">
-      {lines.map((line, i) => {
+      {blocks.map((block, i) => {
+        if (block.type === "table") {
+          return (
+            <table className="lite-md-table" key={`tbl${i}`}>
+              <thead>
+                <tr>
+                  {block.header.map((cell, ci) => (
+                    <th key={ci}>{renderInlineBold(cell, `h${i}-${ci}`)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {block.rows.map((row, ri) => (
+                  <tr key={ri}>
+                    {row.map((cell, ci) => (
+                      <td key={ci}>{renderInlineBold(cell, `r${i}-${ri}-${ci}`)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          );
+        }
+
+        const line = block.text;
         const bulleted = /^\s*[-*]\s+/.test(line);
-        const content = line.replace(/^\s*[-*]\s+/, "");
-        const parts = content.split(/(\*\*[^*]+\*\*)/g).map((p, j) =>
-          p.startsWith("**") && p.endsWith("**") ? (
-            <strong key={j}>{p.slice(2, -2)}</strong>
-          ) : (
-            <React.Fragment key={j}>{p}</React.Fragment>
-          )
-        );
+        const content = line.replace(/^\s*[-*]\s+/, "").replace(/^#{1,6}\s*/, "");
+        const parts = renderInlineBold(content, `l${i}`);
         if (!content.trim()) return <div key={i} style={{ height: 6 }} />;
         return bulleted ? (
           <div key={i} className="lite-md-bullet">
@@ -384,6 +442,7 @@ export default function KaprukaAgent() {
   const [lastDebug, setLastDebug] = useState(null);
   const [errorBanner, setErrorBanner] = useState(null);
   const [orderPopup, setOrderPopup] = useState(null);
+  const [headerSearch, setHeaderSearch] = useState("");
   const scrollRef = useRef(null);
 
   useEffect(() => {
@@ -481,11 +540,16 @@ export default function KaprukaAgent() {
 
         // Surface a successful order confirmation as an impossible-to-miss
         // modal, in addition to its normal place in the chat history.
-        let toolName = null;
+        // Match via tool_use_id, not "last tool_use seen" — see comment in
+        // the Turn component for why that matters when multiple tools are
+        // called in the same turn.
+        const toolNameById = {};
         for (const block of content) {
-          if (block.type === "mcp_tool_use") toolName = block.name;
-          if (block.type === "mcp_tool_result" && toolName === "kapruka_create_order" && !block.is_error) {
-            const parsedOrder = parseToolResult(toolName, block.content, block.is_error);
+          if (block.type === "mcp_tool_use") toolNameById[block.id] = block.name;
+        }
+        for (const block of content) {
+          if (block.type === "mcp_tool_result" && toolNameById[block.tool_use_id] === "kapruka_create_order" && !block.is_error) {
+            const parsedOrder = parseToolResult("kapruka_create_order", block.content, block.is_error);
             if (parsedOrder.kind === "order") setOrderPopup(parsedOrder);
           }
         }
@@ -541,6 +605,25 @@ Currency: ${details.currency}`;
             <div className="kap-brand-sub">shopping assistant · kapruka.com</div>
           </div>
         </div>
+
+        <form
+          className="kap-header-search"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (headerSearch.trim()) {
+              sendToAgent(headerSearch);
+              setHeaderSearch("");
+            }
+          }}
+        >
+          <Search size={14} />
+          <input
+            placeholder="Search for cakes, flowers, gifts…"
+            value={headerSearch}
+            onChange={(e) => setHeaderSearch(e.target.value)}
+          />
+        </form>
+
         <div className="kap-header-actions">
           <button
             className={`kap-icon-btn ${debugOpen ? "kap-icon-btn-active" : ""}`}
@@ -551,8 +634,8 @@ Currency: ${details.currency}`;
           </button>
           <button className="kap-cart-btn" onClick={() => setCartOpen(true)}>
             <ShoppingBag size={17} strokeWidth={2.2} />
-            <span>Cart</span>
-            {cartCount > 0 && <span className="kap-cart-badge">{cartCount}</span>}
+            <span>Cart{cartCount > 0 ? ` (${cartCount})` : ""}</span>
+            {cartCount > 0 && <span className="kap-cart-total">{formatMoney(cartSubtotal, cartCurrency)}</span>}
           </button>
         </div>
       </header>
@@ -660,7 +743,7 @@ Currency: ${details.currency}`;
         <>
           <div className="kap-scrim kap-scrim-visible" onClick={() => setOrderPopup(null)} />
           <div className="kap-order-popup">
-            <button className="kap-icon-btn kap-order-popup-close" onClick={() => setOrderPopup(null)}>
+            <button className="kap-icon-btn kap-icon-btn-light kap-order-popup-close" onClick={() => setOrderPopup(null)}>
               <X size={16} />
             </button>
             <OrderStampCard order={orderPopup} />
@@ -684,9 +767,17 @@ function Turn({ turn, onAddToCart, onCategoryClick }) {
     );
   }
 
-  // assistant: interleave text blocks and tool-result cards, in order
+  // assistant: interleave text blocks and tool-result cards, in order.
+  // Tool results must be matched to their originating call via tool_use_id —
+  // the API can emit several mcp_tool_use blocks back-to-back before any of
+  // their results arrive (e.g. searching products AND checking delivery in
+  // one turn), so "whichever tool_use came last" is not a safe way to know
+  // which tool a given result belongs to.
   const els = [];
-  let pendingToolName = null;
+  const toolNameById = {};
+  turn.blocks.forEach((block) => {
+    if (block.type === "mcp_tool_use") toolNameById[block.id] = block.name;
+  });
 
   turn.blocks.forEach((block, i) => {
     if (block.type === "text" && block.text?.trim()) {
@@ -697,13 +788,12 @@ function Turn({ turn, onAddToCart, onCategoryClick }) {
           </div>
         </div>
       );
-    } else if (block.type === "mcp_tool_use") {
-      pendingToolName = block.name;
     } else if (block.type === "mcp_tool_result") {
-      const parsed = parseToolResult(pendingToolName, block.content, block.is_error);
+      const toolName = toolNameById[block.tool_use_id] || null;
+      const parsed = parseToolResult(toolName, block.content, block.is_error);
       els.push(
         <div className="kap-turn kap-turn-assistant kap-turn-card" key={`r${i}`}>
-          <ToolResultCard toolName={pendingToolName} parsed={parsed} onAddToCart={onAddToCart} onCategoryClick={onCategoryClick} />
+          <ToolResultCard toolName={toolName} parsed={parsed} onAddToCart={onAddToCart} onCategoryClick={onCategoryClick} />
         </div>
       );
     }
@@ -975,7 +1065,7 @@ function CartDrawer({ open, onClose, cart, subtotal, currency, onUpdateQty, onRe
           <div className="kap-drawer-title">
             <ShoppingBag size={16} /> Your cart
           </div>
-          <button className="kap-icon-btn" onClick={onClose}>
+          <button className="kap-icon-btn kap-icon-btn-light" onClick={onClose}>
             <X size={16} />
           </button>
         </div>
@@ -1066,11 +1156,13 @@ function loadDeliveryCities() {
       });
       const data = JSON.parse(await res.text());
       const content = data.content || [];
-      let toolName = null;
+      const toolNameById = {};
       for (const block of content) {
-        if (block.type === "mcp_tool_use") toolName = block.name;
-        if (block.type === "mcp_tool_result" && toolName === "kapruka_list_delivery_cities" && !block.is_error) {
-          const parsed = parseToolResult(toolName, block.content, block.is_error);
+        if (block.type === "mcp_tool_use") toolNameById[block.id] = block.name;
+      }
+      for (const block of content) {
+        if (block.type === "mcp_tool_result" && toolNameById[block.tool_use_id] === "kapruka_list_delivery_cities" && !block.is_error) {
+          const parsed = parseToolResult("kapruka_list_delivery_cities", block.content, block.is_error);
           if (parsed.kind === "cities" && parsed.cities.length) {
             cachedCities = parsed.cities.map((c) => pick(c, ["name", "city"], String(c)));
             return cachedCities;
@@ -1085,6 +1177,58 @@ function loadDeliveryCities() {
   })();
 
   return cachedCitiesPromise;
+}
+
+/** A lightweight searchable dropdown, fully styled and contained within its
+ *  parent — replaces the native <input list=""> + <datalist> combo, which
+ *  renders as an unstyled, oversized browser popup that can overflow the
+ *  modal entirely. */
+function CityCombobox({ value, onChange, options, loading }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    function handleOutsideClick(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, []);
+
+  const filtered = (options || [])
+    .filter((c) => c.toLowerCase().includes((value || "").toLowerCase()))
+    .slice(0, 40);
+
+  return (
+    <div className="kap-combobox" ref={wrapRef}>
+      <input
+        placeholder={loading ? "Loading cities…" : "Type to search…"}
+        value={value}
+        onFocus={() => setOpen(true)}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+        }}
+      />
+      {open && !loading && filtered.length > 0 && (
+        <div className="kap-combobox-list">
+          {filtered.map((c, i) => (
+            <button
+              key={i}
+              type="button"
+              className="kap-combobox-option"
+              onClick={() => {
+                onChange(c);
+                setOpen(false);
+              }}
+            >
+              {c}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function CheckoutModal({ cart, subtotal, currency, onClose, onSubmit }) {
@@ -1128,7 +1272,7 @@ function CheckoutModal({ cart, subtotal, currency, onClose, onSubmit }) {
           <div className="kap-drawer-title">
             <Gift size={16} /> Guest checkout
           </div>
-          <button className="kap-icon-btn" onClick={onClose}>
+          <button className="kap-icon-btn kap-icon-btn-light" onClick={onClose}>
             <X size={16} />
           </button>
         </div>
@@ -1147,17 +1291,12 @@ function CheckoutModal({ cart, subtotal, currency, onClose, onSubmit }) {
           <div className="kap-form-row">
             <div className="kap-field">
               <label className="kap-field-label">City</label>
-              <input
-                list="kap-city-options"
-                placeholder={cityOptions ? "Type to search…" : "Loading cities…"}
+              <CityCombobox
                 value={form.city}
-                onChange={(e) => set("city", e.target.value)}
+                onChange={(v) => set("city", v)}
+                options={cityOptions}
+                loading={cityOptions === null}
               />
-              <datalist id="kap-city-options">
-                {(cityOptions || []).map((c, i) => (
-                  <option key={i} value={c} />
-                ))}
-              </datalist>
             </div>
             <div className="kap-field">
               <label className="kap-field-label">Delivery date</label>
@@ -1243,6 +1382,7 @@ const CSS = `
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
   padding: 14px 18px;
   background: var(--kap-primary);
   color: #F6EFDD;
@@ -1266,12 +1406,27 @@ const CSS = `
   display: flex; align-items: center; justify-content: center; cursor: pointer;
 }
 .kap-icon-btn-active { background: var(--kap-accent); color: var(--kap-primary); border-color: var(--kap-accent); }
+.kap-icon-btn-light { border-color: var(--kap-line); color: var(--kap-ink); }
+.kap-header-search {
+  flex: 1; max-width: 340px; display: none;
+  align-items: center; gap: 8px;
+  background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 20px; padding: 8px 14px; color: rgba(246,239,221,0.75);
+}
+.kap-header-search input {
+  flex: 1; background: none; border: none; outline: none; color: #F6EFDD; font-size: 13px; font-family: 'Inter', sans-serif;
+}
+.kap-header-search input::placeholder { color: rgba(246,239,221,0.55); }
+@media (min-width: 560px) {
+  .kap-header-search { display: flex; }
+}
 .kap-cart-btn {
   display: flex; align-items: center; gap: 6px;
   background: var(--kap-accent); color: var(--kap-primary);
   border: none; border-radius: 20px; padding: 7px 14px 7px 12px;
   font-weight: 600; font-size: 13px; cursor: pointer; position: relative;
 }
+.kap-cart-total { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 700; opacity: 0.85; border-left: 1px solid rgba(20,67,42,0.25); padding-left: 8px; }
 .kap-cart-badge {
   position: absolute; top: -6px; right: -6px;
   background: var(--kap-coral); color: white;
@@ -1313,6 +1468,11 @@ const CSS = `
 .lite-md p:last-child { margin-bottom: 0; }
 .lite-md-bullet { display: flex; gap: 8px; margin-bottom: 4px; align-items: flex-start; }
 .lite-md-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--kap-accent); margin-top: 8px; flex-shrink: 0; }
+.lite-md-table { width: 100%; border-collapse: collapse; margin: 4px 0 8px; font-size: 12.5px; }
+.lite-md-table th, .lite-md-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--kap-line); }
+.lite-md-table th { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.3px; color: #8a8168; font-weight: 700; }
+.lite-md-table td { color: var(--kap-ink); }
+.lite-md-table tr:last-child td { border-bottom: none; }
 
 /* cards */
 .kap-card { background: var(--kap-card); border: 1px solid var(--kap-line); border-radius: 14px; padding: 12px 14px; max-width: 82%; font-size: 13.5px; }
@@ -1477,6 +1637,21 @@ const CSS = `
 .kap-form-row input:focus, .kap-form-full:focus { border-color: var(--kap-accent); }
 .kap-field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
 .kap-field-label { font-size: 10.5px; color: #8a8168; font-weight: 600; }
+.kap-combobox { position: relative; }
+.kap-combobox input { border: 1px solid var(--kap-line); background: white; border-radius: 10px; padding: 9px 11px; font-size: 13px; font-family: 'Inter', sans-serif; outline: none; width: 100%; }
+.kap-combobox input:focus { border-color: var(--kap-accent); }
+.kap-combobox-list {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+  background: white; border: 1px solid var(--kap-line); border-radius: 10px;
+  max-height: 170px; overflow-y: auto; z-index: 30;
+  box-shadow: 0 10px 28px rgba(36,20,23,0.18);
+  display: flex; flex-direction: column; padding: 4px;
+}
+.kap-combobox-option {
+  text-align: left; padding: 8px 10px; border: none; background: none; border-radius: 7px;
+  font-size: 13px; cursor: pointer; font-family: 'Inter', sans-serif; color: var(--kap-ink);
+}
+.kap-combobox-option:hover { background: #FCEEEF; }
 textarea.kap-form-full { resize: vertical; }
 .kap-modal-footer { padding: 12px 16px 16px; border-top: 1px solid var(--kap-line); }
 `;
