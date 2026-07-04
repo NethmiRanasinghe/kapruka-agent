@@ -1202,6 +1202,7 @@ function CityCombobox({ value, onChange, options, loading }) {
   return (
     <div className="kap-combobox" ref={wrapRef}>
       <input
+        className="kap-combobox-input"
         placeholder={loading ? "Loading cities…" : "Type to search…"}
         value={value}
         onFocus={() => setOpen(true)}
@@ -1632,24 +1633,70 @@ const CSS = `
 .kap-modal-body { padding: 14px 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
 .kap-modal-summary { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #6b6252; background: #F1ECDC; padding: 7px 10px; border-radius: 8px; margin-bottom: 4px; }
 .kap-form-section { display: flex; align-items: center; gap: 5px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #8a8168; margin-top: 8px; font-weight: 600; }
-.kap-form-row { display: flex; gap: 8px; }
+.kap-form-row { display: flex; gap: 16px; }
 .kap-form-row input, .kap-form-full { border: 1px solid var(--kap-line); background: white; border-radius: 10px; padding: 9px 11px; font-size: 13px; font-family: 'Inter', sans-serif; outline: none; width: 100%; }
 .kap-form-row input:focus, .kap-form-full:focus { border-color: var(--kap-accent); }
-.kap-field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
 .kap-field-label { font-size: 10.5px; color: #8a8168; font-weight: 600; }
-.kap-combobox { position: relative; }
-.kap-combobox input { border: 1px solid var(--kap-line); background: white; border-radius: 10px; padding: 9px 11px; font-size: 13px; font-family: 'Inter', sans-serif; outline: none; width: 100%; }
-.kap-combobox input:focus { border-color: var(--kap-accent); }
-.kap-combobox-list {
-  position: absolute; top: calc(100% + 4px); left: 0; right: 0;
-  background: white; border: 1px solid var(--kap-line); border-radius: 10px;
-  max-height: 170px; overflow-y: auto; z-index: 30;
-  box-shadow: 0 10px 28px rgba(36,20,23,0.18);
-  display: flex; flex-direction: column; padding: 4px;
+.kap-form-row > * {
+  flex: 1;
+  min-width: 0;
 }
+.kap-field {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.kap-field input[type="date"] {
+  width: 100%;
+  box-sizing: border-box;
+}
+.kap-field input,
+.kap-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+.kap-combobox {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+.kap-combobox-input {
+  width: 100%;
+  height: 48px;
+  box-sizing: border-box;
+}
+.kap-combobox-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 220px;
+  overflow-y: auto;
+
+  background: #fff;
+  border: 1px solid var(--kap-line);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.12);
+  z-index: 1000;
+}
+
 .kap-combobox-option {
-  text-align: left; padding: 8px 10px; border: none; background: none; border-radius: 7px;
-  font-size: 13px; cursor: pointer; font-family: 'Inter', sans-serif; color: var(--kap-ink);
+  display: block;
+  width: 100%;
+  padding: 12px 14px;
+  border: none;
+  background: white;
+  text-align: left;
+  cursor: pointer;
+  font-size: 14px;
+}
+@media (max-width: 640px) {
+  .kap-form-row {
+    flex-direction: column;
+  }
 }
 .kap-combobox-option:hover { background: #FCEEEF; }
 textarea.kap-form-full { resize: vertical; }
