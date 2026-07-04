@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   ShoppingBag, X, Send, Gift, MapPin, Package, Truck, Sparkles,
-  Plus, Minus, Trash2, ExternalLink, Loader2, Bug, Leaf, ChevronDown
+  Plus, Minus, Trash2, ExternalLink, Loader2, Bug, ChevronDown
 } from "lucide-react";
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -31,8 +31,9 @@ Language: default to English. If the customer writes in Sinhala, reply in Sinhal
 
 Rules:
 - Before creating an order, always call kapruka_check_delivery for the city + date + a representative product, and mention the flat delivery rate and any perishable warning to the customer.
-- When asked to check out, call kapruka_create_order with the full cart, recipient, delivery, sender, and gift_message fields as given. After it returns, clearly state the order number and the pay-link, and tell them the price is locked for 60 minutes.
-- For order status questions, call kapruka_track_order with the order number.
+- When asked to check out, call kapruka_create_order with the full cart, recipient, delivery, sender, and gift_message fields as given.
+- IMPORTANT: after kapruka_check_delivery or kapruka_create_order return, do NOT restate the price breakdown, order number, or pay-link in your text reply — the interface already renders a dedicated card with all of that. Just give one short confirming sentence, e.g. "Delivery's available — I'll place the order now!" or "All set — you can pay using the card above." Never repeat numbers, tables, or links you already got from a tool.
+- For order status questions, call kapruka_track_order with the order number. Same rule applies — don't restate what the tracking card already shows.
 - Keep tool-result summaries brief in your text — the interface renders the actual product cards, delivery info, and order details separately, so you don't need to repeat every field back in prose.`;
 
 /* ---------- tiny defensive helpers for unknown JSON shapes ---------- */
@@ -232,6 +233,23 @@ function parseToolResult(toolName, resultContent, isError) {
         raw: json,
       };
     }
+    // Real format: "## Delivery to Gampaha on 2026-07-18\nAvailable — flat rate LKR 870"
+    const headerMatch = rawText.match(/##\s*Delivery to\s*(.+?)\s*on\s*(.+)/i);
+    if (headerMatch) {
+      const deliverable = !/not\s+available/i.test(rawText);
+      const rateMatch = rawText.match(/LKR\s*([\d,]+(?:\.\d+)?)/i);
+      const perishMatch = rawText.match(/(?:⚠️?|perishable[^\n:]*:?)\s*([^\n]+perishable[^\n]*)/i);
+      return {
+        kind: "delivery",
+        deliverable,
+        rate: rateMatch ? parseFloat(rateMatch[1].replace(/,/g, "")) : null,
+        currency: "LKR",
+        city: headerMatch[1].trim(),
+        date: headerMatch[2].trim(),
+        perishable: perishMatch ? perishMatch[1].trim() : null,
+        raw: rawText,
+      };
+    }
   }
 
   if (toolName === "kapruka_create_order") {
@@ -247,6 +265,33 @@ function parseToolResult(toolName, resultContent, isError) {
         raw: json,
       };
     }
+    // Real format:
+    // ## Order created — `ORD-20260704-M7ME`
+    // Grand total: LKR 5,440
+    // | Items | LKR 4,570 |
+    // | Delivery | LKR 870 |
+    // [Open checkout to pay](https://...)
+    // _Checkout link expires at 2026-07-04T08:40:01+05:30. Prices are locked for that window._
+    const orderMatch = rawText.match(/order\D*`([^`]+)`/i);
+    if (orderMatch) {
+      const totalMatch = rawText.match(/Grand total:\s*LKR\s*([\d,]+(?:\.\d+)?)/i);
+      const itemsMatch = rawText.match(/\|\s*Items\s*\|\s*LKR\s*([\d,]+(?:\.\d+)?)\s*\|/i);
+      const deliveryMatch = rawText.match(/\|\s*Delivery\s*\|\s*LKR\s*([\d,]+(?:\.\d+)?)\s*\|/i);
+      const payMatch = rawText.match(/\[[^\]]*(?:pay|checkout)[^\]]*\]\((https?:\/\/[^\)]+)\)/i);
+      const expiryMatch = rawText.match(/expires at\s*([^\s._][^.\n]*)/i);
+      return {
+        kind: "order",
+        orderNumber: orderMatch[1].trim(),
+        payUrl: payMatch ? payMatch[1] : null,
+        total: totalMatch ? parseFloat(totalMatch[1].replace(/,/g, "")) : null,
+        itemsTotal: itemsMatch ? parseFloat(itemsMatch[1].replace(/,/g, "")) : null,
+        deliveryFee: deliveryMatch ? parseFloat(deliveryMatch[1].replace(/,/g, "")) : null,
+        currency: "LKR",
+        status: "order placed",
+        expiresAt: expiryMatch ? expiryMatch[1].trim() : null,
+        raw: rawText,
+      };
+    }
   }
 
   if (toolName === "kapruka_track_order") {
@@ -260,6 +305,21 @@ function parseToolResult(toolName, resultContent, isError) {
         items: firstArray(json, ["items", "cart"]) || [],
         events,
         raw: json,
+      };
+    }
+    // Best-effort markdown fallback — untested against a real sample yet.
+    const orderMatch = rawText.match(/order\D*`([^`]+)`/i);
+    const statusMatch = rawText.match(/status[:\s]+\**([a-z0-9 _-]+)\**/i);
+    const eventLines = [...rawText.matchAll(/^[-*]\s*(.+)$/gm)].map((m) => ({ status: m[1] }));
+    if (orderMatch || statusMatch || eventLines.length) {
+      return {
+        kind: "tracking",
+        orderNumber: orderMatch ? orderMatch[1].trim() : null,
+        status: statusMatch ? statusMatch[1].trim() : "unknown",
+        recipient: null,
+        items: [],
+        events: eventLines,
+        raw: rawText,
       };
     }
   }
@@ -282,6 +342,15 @@ function normalizeProduct(p) {
     category: pick(p, ["category"], null),
   };
 }
+
+const QUICK_NAV = [
+  { icon: "🎂", label: "Cakes", prompt: "Show me your best-selling cakes" },
+  { icon: "🌸", label: "Flowers", prompt: "Show me flower bouquets" },
+  { icon: "🍫", label: "Chocolates", prompt: "Show me chocolate gift boxes" },
+  { icon: "🎁", label: "Gift sets", prompt: "Show me combo and gift sets" },
+  { icon: "🚚", label: "Same day", prompt: "What can be delivered same day?" },
+  { icon: "📦", label: "Track order", prompt: "I'd like to track an order" },
+];
 
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -306,6 +375,7 @@ export default function KaprukaAgent() {
   const [debugOpen, setDebugOpen] = useState(false);
   const [lastDebug, setLastDebug] = useState(null);
   const [errorBanner, setErrorBanner] = useState(null);
+  const [orderPopup, setOrderPopup] = useState(null);
   const scrollRef = useRef(null);
 
   useEffect(() => {
@@ -385,6 +455,17 @@ export default function KaprukaAgent() {
         const content = data.content || [];
         setLastDebug(content);
         setTurns((prev) => [...prev, { role: "assistant", blocks: content }]);
+
+        // Surface a successful order confirmation as an impossible-to-miss
+        // modal, in addition to its normal place in the chat history.
+        let toolName = null;
+        for (const block of content) {
+          if (block.type === "mcp_tool_use") toolName = block.name;
+          if (block.type === "mcp_tool_result" && toolName === "kapruka_create_order" && !block.is_error) {
+            const parsedOrder = parseToolResult(toolName, block.content, block.is_error);
+            if (parsedOrder.kind === "order") setOrderPopup(parsedOrder);
+          }
+        }
       } catch (err) {
         setErrorBanner(err.message || "Something went wrong talking to the agent.");
       } finally {
@@ -430,10 +511,10 @@ Currency: ${details.currency}`;
       <header className="kap-header">
         <div className="kap-brand">
           <div className="kap-brand-mark">
-            <Leaf size={18} strokeWidth={2.2} />
+            <Gift size={17} strokeWidth={2.3} />
           </div>
           <div>
-            <div className="kap-brand-name">Kapu</div>
+            <div className="kap-brand-name">kapu</div>
             <div className="kap-brand-sub">shopping assistant · kapruka.com</div>
           </div>
         </div>
@@ -452,6 +533,16 @@ Currency: ${details.currency}`;
           </button>
         </div>
       </header>
+
+      {/* quick-nav strip — mirrors Kapruka's real category bar */}
+      <nav className="kap-navstrip">
+        {QUICK_NAV.map((n, i) => (
+          <button key={i} className="kap-navchip" onClick={() => sendToAgent(n.prompt)}>
+            <span>{n.icon}</span>
+            {n.label}
+          </button>
+        ))}
+      </nav>
 
       {/* chat scroll area */}
       <main className="kap-chat" ref={scrollRef}>
@@ -539,6 +630,20 @@ Currency: ${details.currency}`;
           onClose={() => setCheckoutOpen(false)}
           onSubmit={handleCheckoutSubmit}
         />
+      )}
+
+      {/* order confirmation — pops up automatically so it's never missed */}
+      {orderPopup && (
+        <>
+          <div className="kap-scrim kap-scrim-visible" onClick={() => setOrderPopup(null)} />
+          <div className="kap-order-popup">
+            <button className="kap-icon-btn kap-order-popup-close" onClick={() => setOrderPopup(null)}>
+              <X size={16} />
+            </button>
+            <OrderStampCard order={orderPopup} />
+            <div className="kap-order-popup-hint">You can also find this order any time in the chat above.</div>
+          </div>
+        </>
       )}
     </div>
   );
@@ -687,15 +792,41 @@ function hashString(str) {
 }
 
 const CARD_GRADIENTS = [
-  "linear-gradient(135deg, #14432A, #1E5C3A)",
-  "linear-gradient(135deg, #E7A339, #D88F22)",
-  "linear-gradient(135deg, #E1636B, #C94952)",
-  "linear-gradient(135deg, #1E5C3A, #E7A339)",
+  "linear-gradient(135deg, #B4182F, #D42642)",
+  "linear-gradient(135deg, #FFB020, #F09400)",
+  "linear-gradient(135deg, #E4536B, #C93A52)",
+  "linear-gradient(135deg, #7A1424, #B4182F)",
 ];
+
+// Simple in-memory cache so we don't re-fetch the same product's image
+// every time it re-renders (e.g. across chat turns in the same session).
+const imageCache = new Map();
 
 function ProductCard({ product, onAddToCart }) {
   const priceLabel = formatMoney(product.price, product.currency);
   const gradient = CARD_GRADIENTS[hashString(product.id) % CARD_GRADIENTS.length];
+  const [realImage, setRealImage] = useState(product.image || imageCache.get(product.url) || null);
+  const [imageFailed, setImageFailed] = useState(false);
+
+  useEffect(() => {
+    if (product.image || !product.url || imageCache.has(product.url)) return;
+    let cancelled = false;
+    fetch(`/api/og-image?url=${encodeURIComponent(product.url)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return;
+        imageCache.set(product.url, data?.image || null);
+        if (data?.image) setRealImage(data.image);
+      })
+      .catch(() => {
+        if (!cancelled) imageCache.set(product.url, null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [product.url, product.image]);
+
+  const showImage = realImage && !imageFailed;
 
   return (
     <div className="kap-product-card">
@@ -706,9 +837,14 @@ function ProductCard({ product, onAddToCart }) {
         rel="noreferrer"
         title={product.url ? "View on Kapruka.com" : product.name}
       >
-        <div className="kap-product-img-wrap" style={{ background: product.image ? undefined : gradient }}>
-          {product.image ? (
-            <img src={product.image} alt={product.name} className="kap-product-img" />
+        <div className="kap-product-img-wrap" style={{ background: showImage ? undefined : gradient }}>
+          {showImage ? (
+            <img
+              src={realImage}
+              alt={product.name}
+              className="kap-product-img"
+              onError={() => setImageFailed(true)}
+            />
           ) : (
             <div className="kap-product-img-fallback">
               <span className="kap-product-emoji">{guessEmoji(product.name)}</span>
@@ -752,6 +888,16 @@ function OrderStampCard({ order }) {
           {order.orderNumber ? `Order #${order.orderNumber}` : "Order created"}
         </div>
         <div className="kap-order-status">{order.status}</div>
+        {(order.itemsTotal !== undefined && order.itemsTotal !== null) && (
+          <div className="kap-order-breakdown">
+            <span>Items</span><span>{formatMoney(order.itemsTotal, order.currency)}</span>
+          </div>
+        )}
+        {(order.deliveryFee !== undefined && order.deliveryFee !== null) && (
+          <div className="kap-order-breakdown">
+            <span>Delivery</span><span>{formatMoney(order.deliveryFee, order.currency)}</span>
+          </div>
+        )}
         {order.total !== null && (
           <div className="kap-order-total">{formatMoney(order.total, order.currency)}</div>
         )}
@@ -960,13 +1106,13 @@ function Search(props) {
 
 const CSS = `
 :root {
-  --kap-bg: #FBF6EC;
-  --kap-ink: #16241C;
-  --kap-primary: #14432A;
-  --kap-primary-light: #1E5C3A;
-  --kap-accent: #E7A339;
-  --kap-coral: #E1636B;
-  --kap-line: #E4DCC8;
+  --kap-bg: #FBF9F6;
+  --kap-ink: #241417;
+  --kap-primary: #B4182F;
+  --kap-primary-light: #D42642;
+  --kap-accent: #FFB020;
+  --kap-coral: #E4536B;
+  --kap-line: #EFE3E1;
   --kap-card: #FFFFFF;
 }
 
@@ -1024,6 +1170,19 @@ const CSS = `
   display: flex; align-items: center; justify-content: center;
   font-family: 'IBM Plex Mono', monospace;
 }
+
+/* quick-nav strip — retail-style category bar */
+.kap-navstrip {
+  display: flex; gap: 6px; padding: 8px 14px; background: var(--kap-card);
+  border-bottom: 1px solid var(--kap-line); overflow-x: auto; flex-shrink: 0;
+}
+.kap-navchip {
+  display: flex; align-items: center; gap: 5px; flex-shrink: 0;
+  border: 1px solid var(--kap-line); background: var(--kap-bg);
+  padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
+  color: var(--kap-ink); cursor: pointer; white-space: nowrap;
+}
+.kap-navchip:hover { border-color: var(--kap-primary); background: #FCEEEF; }
 
 /* chat */
 .kap-chat { flex: 1; overflow-y: auto; }
@@ -1116,6 +1275,7 @@ const CSS = `
 }
 .kap-order-number { font-family: 'Fraunces', serif; font-weight: 700; font-size: 15px; }
 .kap-order-status { color: #6b6252; font-size: 12px; text-transform: capitalize; margin-top: 1px; }
+.kap-order-breakdown { display: flex; justify-content: space-between; gap: 16px; font-size: 11.5px; color: #6b6252; margin-top: 3px; font-family: 'IBM Plex Mono', monospace; }
 .kap-order-total { font-family: 'IBM Plex Mono', monospace; font-weight: 600; margin-top: 4px; }
 .kap-order-expiry { font-size: 11px; color: #8a8168; margin-top: 2px; }
 .kap-pay-btn { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; background: var(--kap-accent); color: var(--kap-primary); text-decoration: none; padding: 7px 14px; border-radius: 20px; font-weight: 700; font-size: 12.5px; }
@@ -1177,6 +1337,18 @@ const CSS = `
 .kap-subtotal-row span:last-child { font-family: 'IBM Plex Mono', monospace; font-weight: 600; }
 .kap-checkout-btn { width: 100%; background: var(--kap-accent); color: var(--kap-primary); border: none; border-radius: 24px; padding: 12px; font-weight: 700; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .kap-checkout-btn:disabled { background: #cfc9b8; cursor: not-allowed; }
+
+/* order confirmation popup — auto-shown so it's never missed */
+.kap-order-popup {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 340px; max-width: 88%;
+  background: var(--kap-bg); border: 1px solid var(--kap-line); border-radius: 18px;
+  padding: 26px 18px 18px; z-index: 23;
+  box-shadow: 0 20px 60px rgba(22,36,28,0.3);
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+}
+.kap-order-popup-close { position: absolute; top: 10px; right: 10px; border-color: var(--kap-line); color: var(--kap-ink); }
+.kap-order-popup-hint { font-size: 11px; color: #8a8168; text-align: center; }
 
 /* modal */
 .kap-modal {
