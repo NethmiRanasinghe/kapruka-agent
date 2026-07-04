@@ -109,6 +109,74 @@ function LiteMarkdown({ text }) {
   );
 }
 
+/* ---------- parsers for the markdown-formatted tool results Kapruka actually returns ---------- */
+
+// Matches blocks like:
+// **1. Product Name**
+//    ID: `SOME_ID` · LKR 1,000 · In stock (low) · ships internationally
+//    [View product](https://...)
+function parseProductsFromMarkdown(text) {
+  if (!text) return [];
+  const products = [];
+  const blockRegex = /\*\*(?:\d+\.\s*)?([^*]+?)\*\*\s*\n\s*ID:\s*`([^`]+)`([^\n]*)\n\s*\[View product\]\(([^)]+)\)/g;
+  let m;
+  while ((m = blockRegex.exec(text)) !== null) {
+    const [, name, id, meta, url] = m;
+    const priceMatch = meta.match(/LKR\s*([\d,]+(?:\.\d+)?)/i);
+    const price = priceMatch ? parseFloat(priceMatch[1].replace(/,/g, "")) : null;
+    const outOfStock = /out of stock/i.test(meta);
+    const lowStock = !outOfStock && /low/i.test(meta);
+    products.push({
+      id: id.trim(),
+      name: name.trim(),
+      price,
+      currency: "LKR",
+      url: url.trim(),
+      inStock: !outOfStock,
+      lowStock,
+      image: null,
+    });
+  }
+  return products;
+}
+
+// Matches a markdown link list: - [Category Name](https://...)
+function parseCategoriesFromMarkdown(text) {
+  if (!text) return [];
+  const categories = [];
+  const re = /[-*]\s*\[([^\]]+)\]\(([^)]+)\)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    categories.push({ name: m[1].trim(), url: m[2].trim() });
+  }
+  return categories;
+}
+
+const EMOJI_RULES = [
+  [/cake/i, "🎂"], [/mug|cup/i, "☕"], [/voucher/i, "🎟️"], [/puzzle|toy/i, "🧩"],
+  [/flower/i, "🌸"], [/chocolate/i, "🍫"], [/fruit/i, "🍎"], [/jewel/i, "💍"],
+  [/perfume/i, "🌺"], [/book/i, "📖"], [/wine|liquor/i, "🍷"], [/pet/i, "🐾"],
+  [/baby/i, "🍼"], [/plant/i, "🪴"], [/watch/i, "⌚"], [/bag/i, "👜"],
+];
+function guessEmoji(name) {
+  for (const [re, emoji] of EMOJI_RULES) if (re.test(name)) return emoji;
+  return "🎁";
+}
+
+const CATEGORY_ICON_RULES = [
+  [/cake/i, "🎂"], [/flower/i, "🌸"], [/chocolate/i, "🍫"], [/fruit|vegetable/i, "🍎"],
+  [/jewel/i, "💍"], [/perfume/i, "🌺"], [/book/i, "📖"], [/toy|kid|child/i, "🧸"],
+  [/liquor|wine/i, "🍷"], [/pet/i, "🐾"], [/baby/i, "🍼"], [/grocery/i, "🛒"],
+  [/electronic/i, "🔌"], [/cloth|fashion/i, "👕"], [/wedding|bride/i, "💒"],
+  [/birthday/i, "🎈"], [/anniversary|lover|valentine|youandme/i, "❤️"],
+  [/christmas/i, "🎄"], [/gift/i, "🎁"], [/corporate/i, "💼"], [/pharmacy|ayurvedic/i, "💊"],
+  [/sport/i, "🏸"], [/home|household/i, "🏠"], [/automobile|bicycle/i, "🚲"],
+];
+function guessCategoryIcon(name) {
+  for (const [re, emoji] of CATEGORY_ICON_RULES) if (re.test(name)) return emoji;
+  return "🏷️";
+}
+
 /* ---------- parse a single mcp_tool_result into a renderable shape ---------- */
 
 function parseToolResult(toolName, resultContent, isError) {
@@ -122,9 +190,10 @@ function parseToolResult(toolName, resultContent, isError) {
   if (toolName === "kapruka_search_products") {
     const arr = json && (firstArray(json, ["products", "results", "items", "data"]) || (Array.isArray(json) ? json : null));
     if (arr) {
-      const products = arr.map(normalizeProduct);
-      return { kind: "products", products, raw: json };
+      return { kind: "products", products: arr.map(normalizeProduct), raw: json };
     }
+    const mdProducts = parseProductsFromMarkdown(rawText);
+    if (mdProducts.length) return { kind: "products", products: mdProducts, raw: rawText };
   }
 
   if (toolName === "kapruka_get_product") {
@@ -132,16 +201,22 @@ function parseToolResult(toolName, resultContent, isError) {
     if (obj && (obj.id || obj.product_id || obj.name || obj.title)) {
       return { kind: "products", products: [normalizeProduct(obj)], raw: json };
     }
+    const mdProducts = parseProductsFromMarkdown(rawText);
+    if (mdProducts.length) return { kind: "products", products: mdProducts, raw: rawText };
   }
 
   if (toolName === "kapruka_list_categories") {
     const arr = json && firstArray(json, ["categories", "results", "items"]);
     if (arr) return { kind: "categories", categories: arr, raw: json };
+    const mdCats = parseCategoriesFromMarkdown(rawText);
+    if (mdCats.length) return { kind: "categories", categories: mdCats, raw: rawText };
   }
 
   if (toolName === "kapruka_list_delivery_cities") {
     const arr = json && firstArray(json, ["cities", "results", "items", "matches"]);
     if (arr) return { kind: "cities", cities: arr, raw: json };
+    const mdCats = parseCategoriesFromMarkdown(rawText); // cities often come as the same link-list format
+    if (mdCats.length) return { kind: "cities", cities: mdCats, raw: rawText };
   }
 
   if (toolName === "kapruka_check_delivery") {
@@ -203,6 +278,7 @@ function normalizeProduct(p) {
     image: pick(p, ["image", "image_url", "thumbnail"], images ? images[0] : null),
     url: pick(p, ["url", "product_url", "link"], null),
     inStock: pick(p, ["in_stock", "available", "stock"], true),
+    lowStock: false,
     category: pick(p, ["category"], null),
   };
 }
@@ -381,7 +457,12 @@ Currency: ${details.currency}`;
       <main className="kap-chat" ref={scrollRef}>
         <div className="kap-chat-inner">
           {turns.map((t, i) => (
-            <Turn key={i} turn={t} onAddToCart={addToCart} />
+            <Turn
+              key={i}
+              turn={t}
+              onAddToCart={addToCart}
+              onCategoryClick={(name) => sendToAgent(`Show me your best products in the "${name}" category`)}
+            />
           ))}
 
           {loading && (
@@ -465,7 +546,7 @@ Currency: ${details.currency}`;
 
 /* ────────────────────────────────────────────────────────────────────── */
 
-function Turn({ turn, onAddToCart }) {
+function Turn({ turn, onAddToCart, onCategoryClick }) {
   if (turn.role === "user") {
     const text = turn.blocks.find((b) => b.type === "text")?.text || "";
     return (
@@ -494,7 +575,7 @@ function Turn({ turn, onAddToCart }) {
       const parsed = parseToolResult(pendingToolName, block.content, block.is_error);
       els.push(
         <div className="kap-turn kap-turn-assistant kap-turn-card" key={`r${i}`}>
-          <ToolResultCard toolName={pendingToolName} parsed={parsed} onAddToCart={onAddToCart} />
+          <ToolResultCard toolName={pendingToolName} parsed={parsed} onAddToCart={onAddToCart} onCategoryClick={onCategoryClick} />
         </div>
       );
     }
@@ -503,7 +584,7 @@ function Turn({ turn, onAddToCart }) {
   return <>{els}</>;
 }
 
-function ToolResultCard({ toolName, parsed, onAddToCart }) {
+function ToolResultCard({ toolName, parsed, onAddToCart, onCategoryClick }) {
   if (parsed.kind === "error") {
     return (
       <div className="kap-card kap-card-error">
@@ -533,12 +614,22 @@ function ToolResultCard({ toolName, parsed, onAddToCart }) {
 
   if (parsed.kind === "categories") {
     return (
-      <div className="kap-card kap-card-categories">
-        {parsed.categories.map((c, i) => (
-          <span className="kap-tag" key={i}>
-            {pick(c, ["name", "title"], String(c))}
-          </span>
-        ))}
+      <div className="kap-category-grid">
+        {parsed.categories.map((c, i) => {
+          const name = pick(c, ["name", "title"], String(c));
+          const url = pick(c, ["url", "link"], null);
+          return (
+            <button
+              className="kap-category-tile"
+              key={i}
+              onClick={() => onCategoryClick && onCategoryClick(name)}
+              title={url ? `Browse ${name}` : name}
+            >
+              <span className="kap-category-emoji">{guessCategoryIcon(name)}</span>
+              <span className="kap-category-name">{name}</span>
+            </button>
+          );
+        })}
       </div>
     );
   }
@@ -589,37 +680,59 @@ function ToolResultCard({ toolName, parsed, onAddToCart }) {
   );
 }
 
+function hashString(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+const CARD_GRADIENTS = [
+  "linear-gradient(135deg, #14432A, #1E5C3A)",
+  "linear-gradient(135deg, #E7A339, #D88F22)",
+  "linear-gradient(135deg, #E1636B, #C94952)",
+  "linear-gradient(135deg, #1E5C3A, #E7A339)",
+];
+
 function ProductCard({ product, onAddToCart }) {
   const priceLabel = formatMoney(product.price, product.currency);
+  const gradient = CARD_GRADIENTS[hashString(product.id) % CARD_GRADIENTS.length];
+
   return (
     <div className="kap-product-card">
-      <div className="kap-product-img-wrap">
-        {product.image ? (
-          <img src={product.image} alt={product.name} className="kap-product-img" />
-        ) : (
-          <div className="kap-product-img-fallback">
-            <Gift size={22} />
-          </div>
-        )}
-        {!product.inStock && <div className="kap-stock-badge">Out of stock</div>}
-      </div>
-      <div className="kap-product-body">
-        <div className="kap-product-name">{product.name}</div>
-        {priceLabel && <div className="kap-product-price">{priceLabel}</div>}
-        <div className="kap-product-actions">
-          <button
-            className="kap-add-btn"
-            disabled={!product.inStock}
-            onClick={() => onAddToCart(product)}
-          >
-            <Plus size={13} /> Add
-          </button>
+      <a
+        className="kap-product-link"
+        href={product.url || undefined}
+        target="_blank"
+        rel="noreferrer"
+        title={product.url ? "View on Kapruka.com" : product.name}
+      >
+        <div className="kap-product-img-wrap" style={{ background: product.image ? undefined : gradient }}>
+          {product.image ? (
+            <img src={product.image} alt={product.name} className="kap-product-img" />
+          ) : (
+            <div className="kap-product-img-fallback">
+              <span className="kap-product-emoji">{guessEmoji(product.name)}</span>
+            </div>
+          )}
+          {!product.inStock && <div className="kap-stock-badge kap-stock-out">Out of stock</div>}
+          {product.inStock && product.lowStock && <div className="kap-stock-badge kap-stock-low">Low stock</div>}
           {product.url && (
-            <a href={product.url} target="_blank" rel="noreferrer" className="kap-view-link">
-              <ExternalLink size={13} />
-            </a>
+            <div className="kap-product-view-hint">
+              <ExternalLink size={12} /> View
+            </div>
           )}
         </div>
+        <div className="kap-product-name">{product.name}</div>
+      </a>
+      <div className="kap-product-body">
+        {priceLabel && <div className="kap-product-price">{priceLabel}</div>}
+        <button
+          className="kap-add-btn"
+          disabled={!product.inStock}
+          onClick={() => onAddToCart(product)}
+        >
+          <Plus size={13} /> Add to cart
+        </button>
       </div>
     </div>
   );
@@ -940,24 +1053,48 @@ const CSS = `
 .kap-card-categories { display: flex; flex-wrap: wrap; gap: 6px; }
 .kap-tag { display: inline-flex; align-items: center; gap: 4px; background: #F1ECDC; border: 1px solid var(--kap-line); padding: 4px 10px; border-radius: 20px; font-size: 12px; }
 
+/* category grid — clickable, icon + label, scrolls if long */
+.kap-category-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px; max-width: 90%; max-height: 230px; overflow-y: auto;
+  padding: 4px; background: var(--kap-card); border: 1px solid var(--kap-line); border-radius: 14px;
+}
+.kap-category-tile {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: #FBF6EC; border: 1px solid var(--kap-line); border-radius: 10px;
+  padding: 10px 6px; cursor: pointer; font-family: 'Inter', sans-serif;
+}
+.kap-category-tile:hover { border-color: var(--kap-accent); background: #F6EFDD; }
+.kap-category-emoji { font-size: 18px; }
+.kap-category-name { font-size: 10.5px; font-weight: 600; text-align: center; line-height: 1.25; color: var(--kap-ink); }
+
 /* product cards */
 .kap-product-row { display: flex; gap: 10px; overflow-x: auto; padding: 2px 2px 8px; max-width: 100%; }
 .kap-product-card {
-  flex-shrink: 0; width: 148px; background: var(--kap-card);
+  flex-shrink: 0; width: 150px; background: var(--kap-card);
   border: 1px solid var(--kap-line); border-radius: 14px; overflow: hidden;
   display: flex; flex-direction: column;
 }
-.kap-product-img-wrap { position: relative; width: 100%; height: 110px; background: #F1ECDC; }
+.kap-product-link { display: block; text-decoration: none; color: inherit; }
+.kap-product-img-wrap { position: relative; width: 100%; height: 100px; background: #F1ECDC; }
 .kap-product-img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.kap-product-img-fallback { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #b9ae94; }
-.kap-stock-badge { position: absolute; bottom: 6px; left: 6px; background: rgba(22,36,28,0.85); color: white; font-size: 9.5px; padding: 2px 7px; border-radius: 10px; }
-.kap-product-body { padding: 9px 10px 10px; display: flex; flex-direction: column; gap: 4px; }
-.kap-product-name { font-size: 12.5px; font-weight: 600; line-height: 1.3; min-height: 32px; }
-.kap-product-price { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--kap-primary); font-weight: 600; }
-.kap-product-actions { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
-.kap-add-btn { flex: 1; display: flex; align-items: center; justify-content: center; gap: 4px; background: var(--kap-primary); color: #F6EFDD; border: none; border-radius: 20px; padding: 6px 0; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.kap-product-img-fallback { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+.kap-product-emoji { font-size: 30px; }
+.kap-stock-badge { position: absolute; bottom: 6px; left: 6px; font-size: 9.5px; padding: 2px 7px; border-radius: 10px; font-weight: 600; }
+.kap-stock-out { background: rgba(22,36,28,0.85); color: white; }
+.kap-stock-low { background: var(--kap-accent); color: var(--kap-primary); }
+.kap-product-view-hint {
+  position: absolute; top: 6px; right: 6px; display: flex; align-items: center; gap: 3px;
+  background: rgba(255,255,255,0.92); color: var(--kap-primary); font-size: 9.5px; font-weight: 700;
+  padding: 3px 7px; border-radius: 10px; opacity: 0; transition: opacity 0.15s;
+}
+.kap-product-card:hover .kap-product-view-hint { opacity: 1; }
+.kap-product-name { font-size: 12.5px; font-weight: 600; line-height: 1.3; padding: 8px 10px 0; min-height: 30px; }
+.kap-product-body { padding: 6px 10px 10px; display: flex; flex-direction: column; gap: 6px; }
+.kap-product-price { font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: var(--kap-primary); font-weight: 700; }
+.kap-add-btn { display: flex; align-items: center; justify-content: center; gap: 4px; background: var(--kap-primary); color: #F6EFDD; border: none; border-radius: 20px; padding: 7px 0; font-size: 11.5px; font-weight: 600; cursor: pointer; width: 100%; }
 .kap-add-btn:disabled { background: #cfc9b8; cursor: not-allowed; }
-.kap-view-link { color: #8a8168; display: flex; }
+
 
 /* delivery card */
 .kap-delivery-card { display: flex; gap: 10px; align-items: flex-start; border-left: 3px solid var(--kap-primary); }
