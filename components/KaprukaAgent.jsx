@@ -446,7 +446,22 @@ export default function KaprukaAgent() {
           }),
         });
 
-        const data = await res.json();
+        // Read as text first — a platform-level failure (e.g. a Vercel
+        // function timeout) returns an HTML/plain-text error page, not
+        // JSON, and calling res.json() directly on that throws a confusing
+        // "Unexpected token" error instead of telling you what happened.
+        const rawBody = await res.text();
+        let data;
+        try {
+          data = JSON.parse(rawBody);
+        } catch {
+          const looksLikeTimeout = /timeout|FUNCTION_INVOCATION/i.test(rawBody);
+          throw new Error(
+            looksLikeTimeout
+              ? "The server took too long to respond (function timeout). This usually means the conversation needed several tool calls in a row — try asking a simpler follow-up, or check Vercel's function duration settings."
+              : `Server returned an unexpected response: "${rawBody.slice(0, 120)}"`
+          );
+        }
 
         if (!res.ok) {
           throw new Error(data?.error?.message || `Request failed (${res.status})`);
@@ -1011,6 +1026,59 @@ function CartDrawer({ open, onClose, cart, subtotal, currency, onUpdateQty, onRe
 
 /* ---------- checkout modal ---------- */
 
+// Major Sri Lankan cities/districts as a fallback if the live city list
+// can't be fetched — keeps the searchable dropdown useful either way.
+const FALLBACK_CITIES = [
+  "Colombo", "Gampaha", "Kalutara", "Kandy", "Matale", "Nuwara Eliya",
+  "Galle", "Matara", "Hambantota", "Jaffna", "Kilinochchi", "Mannar",
+  "Vavuniya", "Mullaitivu", "Batticaloa", "Ampara", "Trincomalee",
+  "Kurunegala", "Puttalam", "Anuradhapura", "Polonnaruwa", "Badulla",
+  "Monaragala", "Ratnapura", "Kegalle", "Negombo",
+];
+
+let cachedCities = null;
+let cachedCitiesPromise = null;
+
+/** Fetches the real delivery city list once via an isolated /api/chat call
+ *  (kept out of the visible chat history), caching the result for the rest
+ *  of the session. Falls back to FALLBACK_CITIES if anything goes wrong. */
+function loadDeliveryCities() {
+  if (cachedCities) return Promise.resolve(cachedCities);
+  if (cachedCitiesPromise) return cachedCitiesPromise;
+
+  cachedCitiesPromise = (async () => {
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          system: "Call kapruka_list_delivery_cities and return only its result, no extra commentary.",
+          messages: [{ role: "user", content: [{ type: "text", text: "List every city you deliver to." }] }],
+        }),
+      });
+      const data = JSON.parse(await res.text());
+      const content = data.content || [];
+      let toolName = null;
+      for (const block of content) {
+        if (block.type === "mcp_tool_use") toolName = block.name;
+        if (block.type === "mcp_tool_result" && toolName === "kapruka_list_delivery_cities" && !block.is_error) {
+          const parsed = parseToolResult(toolName, block.content, block.is_error);
+          if (parsed.kind === "cities" && parsed.cities.length) {
+            cachedCities = parsed.cities.map((c) => pick(c, ["name", "city"], String(c)));
+            return cachedCities;
+          }
+        }
+      }
+    } catch {
+      // fall through to fallback list below
+    }
+    cachedCities = FALLBACK_CITIES;
+    return cachedCities;
+  })();
+
+  return cachedCitiesPromise;
+}
+
 function CheckoutModal({ cart, subtotal, currency, onClose, onSubmit }) {
   const [form, setForm] = useState({
     recipientName: "",
@@ -1023,6 +1091,19 @@ function CheckoutModal({ cart, subtotal, currency, onClose, onSubmit }) {
     giftMessage: "",
     currency: currency || "LKR",
   });
+  const [cityOptions, setCityOptions] = useState(null); // null while loading
+
+  useEffect(() => {
+    let cancelled = false;
+    loadDeliveryCities().then((cities) => {
+      if (!cancelled) setCityOptions(cities);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const todayISO = new Date().toISOString().slice(0, 10);
 
   function set(k, v) {
     setForm((f) => ({ ...f, [k]: v }));
@@ -1056,8 +1137,29 @@ function CheckoutModal({ cart, subtotal, currency, onClose, onSubmit }) {
           </div>
           <input className="kap-form-full" placeholder="Delivery address" value={form.address} onChange={(e) => set("address", e.target.value)} />
           <div className="kap-form-row">
-            <input placeholder="City" value={form.city} onChange={(e) => set("city", e.target.value)} />
-            <input type="date" value={form.date} onChange={(e) => set("date", e.target.value)} />
+            <div className="kap-field">
+              <label className="kap-field-label">City</label>
+              <input
+                list="kap-city-options"
+                placeholder={cityOptions ? "Type to search…" : "Loading cities…"}
+                value={form.city}
+                onChange={(e) => set("city", e.target.value)}
+              />
+              <datalist id="kap-city-options">
+                {(cityOptions || []).map((c, i) => (
+                  <option key={i} value={c} />
+                ))}
+              </datalist>
+            </div>
+            <div className="kap-field">
+              <label className="kap-field-label">Delivery date</label>
+              <input
+                type="date"
+                min={todayISO}
+                value={form.date}
+                onChange={(e) => set("date", e.target.value)}
+              />
+            </div>
           </div>
 
           <div className="kap-form-section">Sender</div>
@@ -1365,6 +1467,8 @@ const CSS = `
 .kap-form-row { display: flex; gap: 8px; }
 .kap-form-row input, .kap-form-full { border: 1px solid var(--kap-line); background: white; border-radius: 10px; padding: 9px 11px; font-size: 13px; font-family: 'Inter', sans-serif; outline: none; width: 100%; }
 .kap-form-row input:focus, .kap-form-full:focus { border-color: var(--kap-accent); }
+.kap-field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+.kap-field-label { font-size: 10.5px; color: #8a8168; font-weight: 600; }
 textarea.kap-form-full { resize: vertical; }
 .kap-modal-footer { padding: 12px 16px 16px; border-top: 1px solid var(--kap-line); }
 `;
